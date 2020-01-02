@@ -1,5 +1,5 @@
 // nullmailer -- a simple relay-only MTA
-// Copyright (C) 2018  Bruce Guenter <bruce@untroubled.org>
+// Copyright (C) 2007  Bruce Guenter <bruce@untroubled.org>
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -38,7 +38,7 @@
 #include "configio.h"
 #include "cli++/cli++.h"
 #include "makefield.h"
-#include "forkexec.h"
+#include "inifile.h"
 
 enum {
   use_args, use_both, use_either, use_header
@@ -48,6 +48,8 @@ static int show_message = false;
 static int show_envelope = false;
 static const char* o_from = 0;
 
+const char* config_file = "/etc/nullmailer/nullmailer.conf";
+const char* aliases_file = "/etc/aliases";
 const char* cli_program = "nullmailer-inject";
 const char* cli_help_prefix = "Reformat and inject a message into the nullmailer queue\n";
 const char* cli_help_suffix = "";
@@ -72,14 +74,15 @@ cli_option cli_options[] = {
   {0, 0, cli_option::flag, 0, 0, 0, 0}
 };
 
-#define fail(MSG) do{ ferr << "nullmailer-inject: " << MSG << endl; return false; }while(0)
-#define fail_sys(MSG) do{ ferr << "nullmailer-inject: " << MSG << ": " << strerror(errno) << endl; return false; }while(0)
-#define bad_hdr(LINE,MSG) do{ header_has_errors = true; ferr << "nullmailer-inject: Invalid header line:\n  " << LINE << "\n  " MSG << endl; }while(0)
+#define fail(MSG) do{ fout << "nullmailer-inject: " << MSG << endl; return false; }while(0)
+#define fail_sys(MSG) do{ fout << "nullmailer-inject: " << MSG << ": " << strerror(errno) << endl; return false; }while(0)
+#define bad_hdr(LINE,MSG) do{ header_has_errors = true; fout << "nullmailer-inject: Invalid header line:\n  " << LINE << "\n  " MSG << endl; }while(0)
 
 typedef list<mystring> slist;
 // static bool do_debug = false;
 
 static mystring cur_line;
+static mystring nqueue;
 
 ///////////////////////////////////////////////////////////////////////////////
 // Configuration
@@ -90,12 +93,24 @@ extern void canonicalize(mystring& domain);
 
 void read_config()
 {
+  const char* env;
   mystring tmp;
+  CINIFile inifile; 
+  char szValue[MAX_PATH+1];
+
   read_hostnames();
   if(!config_read("idhost", idhost))
     idhost = me;
   else
     canonicalize(idhost);
+  if(inifile.GetStringValue(szValue,"NULLMAILER_QUEUE",MAX_PATH))
+    nqueue = szValue;
+  else if ((env = getenv("NULLMAILER_QUEUE")) != 0)
+    nqueue = env;
+  else {
+    nqueue = SBIN_DIR;
+    nqueue += "/nullmailer-queue";
+  }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -104,15 +119,24 @@ void read_config()
 static slist recipients;
 static mystring sender;
 static bool use_header_recips = true;
-static bool use_header_sender = true;
 
 void parse_recips(const mystring& list)
 {
   if(!!list) {
+    mystring recipient;
     int start = 0;
     int end;
+    CINIFile aliasfile;    
+    char szValue[MAX_PATH+1];
+
+    aliasfile.SetOptionSeparator(':');
+    aliasfile.SetINIFilename(aliases_file);
+
     while((end = list.find_first('\n', start)) >= 0) {
-      recipients.append(list.sub(start, end-start));
+      recipient=list.sub(start, end-start);
+      if(aliasfile.GetStringValue(szValue,recipient.c_str(),MAX_PATH))
+        recipient=szValue;
+      recipients.append(recipient);
       start = end+1;
     }
   }
@@ -145,6 +169,7 @@ static slist headers;
 static bool header_is_resent = false;
 static bool header_has_errors = false;
 static bool header_add_to = false;
+static bool header_remove_from = false;
 
 struct header_field
 {
@@ -169,8 +194,7 @@ struct header_field
 	return true;
       if(is_resent) {
 	if(!header_is_resent) {
-	  if(use_header_sender)
-            sender = "";
+	  sender = "";
 	  if(use_header_recips)
 	    recipients.empty();
 	}
@@ -192,7 +216,7 @@ struct header_field
 	      parse_recips(list);
 	  }
 	  else if(is_sender) {
-	    if(is_resent == header_is_resent && use_header_sender)
+	    if(is_resent == header_is_resent && !sender)
 	      parse_sender(list);
 	  }
 	}
@@ -255,7 +279,18 @@ static mystring from;
 
 void setup_from()
 {
-  mystring user = getenv("NULLMAILER_USER");
+  CINIFile inifile;
+  mystring user;
+  mystring host;
+  mystring name;
+  mystring suser;
+  mystring shost;
+  char szValue[MAX_PATH+1];
+
+  inifile.SetINIFilename(config_file);
+  if(inifile.GetStringValue(szValue,"NULLMAILER_USER",MAX_PATH))
+  	user=szValue;
+  if(!user) user = getenv("NULLMAILER_USER");
   if(!user) user = getenv("MAILUSER");
   if(!user) user = getenv("USER");
   if(!user) user = getenv("LOGNAME");
@@ -265,16 +300,19 @@ void setup_from()
   }
   if(!user) user = "unknown";
 
-  mystring host = getenv("NULLMAILER_HOST");
+  if(inifile.GetStringValue(szValue,"NULLMAILER_HOST",MAX_PATH))
+	  host=szValue;
+  if(!host) host = getenv("NULLMAILER_HOST");
   if(!host) host = getenv("MAILHOST");
   if(!host) host = getenv("HOSTNAME");
   if(!host) host = defaulthost;
   canonicalize(host);
 
-  mystring name = getenv("NULLMAILER_NAME");
+  if(inifile.GetStringValue(szValue,"NULLMAILER_NAME",MAX_PATH))
+	  name=szValue;
+  if(!name) name = getenv("NULLMAILER_NAME");
   if(!name) name = getenv("MAILNAME");
   if(!name) name = getenv("NAME");
-  if(!name) name = user;
 
   if(use_name_address_style) {
     if(!name) from = "<" + user + "@" + host + ">";
@@ -285,14 +323,18 @@ void setup_from()
     else      from = user + "@" + host + " (" + name + ")";
   }
   
-  mystring suser = getenv("NULLMAILER_SUSER");
+  if(inifile.GetStringValue(szValue,"NULLMAILER_SUSER",MAX_PATH))
+	  suser=szValue;
+  if(!suser) suser = getenv("NULLMAILER_SUSER");
   if(!suser) suser = user;
 
-  mystring shost = getenv("NULLMAILER_SHOST");
+  if(inifile.GetStringValue(szValue,"NULLMAILER_SHOST",MAX_PATH))
+	  shost=szValue;
+  if(!suser) shost = getenv("NULLMAILER_SHOST");
   if(!shost) shost = host;
   canonicalize(shost);
   
-  if(use_header_sender && !sender)
+  if(!sender)
     sender = suser + "@" + shost;
 }
 
@@ -341,18 +383,37 @@ bool is_continuation(const mystring& line)
 
 bool read_header()
 {
-  mystring cur_line;
   mystring whole;
-  bool first = true;
-  for (;;) {
-    if (!fin.getline(cur_line))
-      cur_line = "";
+  const char* sz_cur_line;
+  
+  while(fin.getline(cur_line)) {
     if(!cur_line || cur_line == "\r")
       break;
-    // Ignore a leading RFC 976 "From " line mistakenly inserted by some programs.
-    if(first && (cur_line.starts_with("From ") || cur_line.starts_with(">From ")))
-      continue;
-    first = false;
+    sz_cur_line=cur_line.c_str();
+    if(strncasecmp(sz_cur_line, "From:", 5)==0 && header_remove_from==true)
+     continue;
+    if(strncasecmp(sz_cur_line, "To:", 3)==0 ){
+      char szValue[MAX_PATH+1];
+      char szAdress[MAX_PATH+1];
+      int count,begin;
+      CINIFile aliasfile;
+      
+      aliasfile.SetOptionSeparator(':');
+      aliasfile.SetINIFilename(aliases_file);
+      count=3;
+      while(sz_cur_line[count]==' ' && sz_cur_line[count]!='\0')
+       count++;
+      begin=count;
+      while(sz_cur_line[count]!=' ' && sz_cur_line[count]!='\0'){
+       szAdress[count-begin]=sz_cur_line[count];
+       count++;
+      }
+      szAdress[count-begin]='\0';
+      strcpy(szValue,"To: ");
+      if(aliasfile.GetStringValue(&szValue[4],szAdress,MAX_PATH-4))
+        cur_line=szValue;
+    }
+
     if(!!whole && is_continuation(cur_line)) {
       //if(!whole)
       //bad_hdr(cur_line, "First line cannot be a continuation line.");
@@ -398,7 +459,7 @@ bool fix_header()
     if(!header_has_mid)
       headers.append("Message-Id: " + make_messageid(idhost));
     if(!header_has_from)
-      headers.append("From: " + from);
+      headers.append("From : " + from);
     if(!header_has_to && !header_has_cc && header_add_to &&
        recipients.count() > 0) {
       header_has_to = true;
@@ -426,62 +487,101 @@ bool fix_header()
 ///////////////////////////////////////////////////////////////////////////////
 // Message sending
 ///////////////////////////////////////////////////////////////////////////////
-bool send_env(fdobuf& out)
+static fdobuf* nqpipe = 0;
+static pid_t pid = 0;
+
+void exec_queue()
 {
-  if(!(out << sender << "\n"))
+  execl(nqueue.c_str(), nqueue.c_str(), NULL);
+  fout << "nullmailer-inject: Could not exec " << nqueue << ": "
+       << strerror(errno) << endl;
+  exit(1);
+}
+
+bool start_queue()
+{
+  int pipe1[2];
+  if(pipe(pipe1) == -1)
+    fail_sys("Could not create pipe to nullmailer-queue");
+  fout.flush();
+  pid = fork();
+  if(pid == -1)
+    fail_sys("Could not fork");
+  if(pid == 0) {
+    close(pipe1[1]);
+    close(0);
+    dup2(pipe1[0], 0);
+    exec_queue();
+  }
+  else {
+    close(pipe1[0]);
+    nqpipe = new fdobuf(pipe1[1], true);
+  }
+  return true;
+}
+
+bool send_env()
+{
+  if(!(*nqpipe << sender << "\n"))
     fail("Error sending sender to nullmailer-queue.");
   for(slist::iter iter(recipients); iter; iter++)
-    if(!(out << *iter << "\n"))
+    if(!(*nqpipe << *iter << "\n"))
       fail("Error sending recipients to nullmailer-queue.");
-  if(!(out << endl))
+  if(!(*nqpipe << endl))
     fail("Error sending recipients to nullmailer-queue.");
   return true;
 }
 
-bool send_header(fdobuf& out)
+bool send_header()
 {
   for(slist::iter iter(headers); iter; iter++)
-    if(!(out << *iter << "\n"))
+    if(!(*nqpipe << *iter << "\n"))
       fail("Error sending header to nullmailer-queue.");
-  if(!(out << endl))
+  if(!(*nqpipe << endl))
     fail("Error sending header to nullmailer-queue.");
   return true;
 }
 
-bool send_body(fdobuf& out)
+bool send_body()
 {
-  if(!(out << cur_line) ||
-     !fdbuf_copy(fin, out))
+  if(!(*nqpipe << cur_line) ||
+     !fdbuf_copy(fin, *nqpipe))
     fail("Error sending message body to nullmailer-queue.");
   return true;
 }
 
-bool send_message_stdout()
+bool wait_queue()
 {
-  if(show_envelope)
-    send_env(fout);
-  send_header(fout);
-  send_body(fout);
-  return true;
-}
-
-bool send_message_nqueue()
-{
-  queue_pipe nq;
-  autoclose wfd = nq.start();
-  if (wfd < 0)
-    return false;
-  fdobuf nqout(wfd);
-  if (!send_env(nqout) || !send_header(nqout) || !send_body(nqout))
-    return false;
-  nqout.flush();
-  wfd.close();
-  return nq.wait();
+  if(!nqpipe->close())
+    fail("Error closing pipe to nullmailer-queue.");
+  int status;
+  if(waitpid(pid, &status, 0) == -1)
+    fail("Error catching the return value from nullmailer-queue.");
+  if(WIFEXITED(status)) {
+    status = WEXITSTATUS(status);
+    if(status)
+      fail("nullmailer-queue failed.");
+    else
+      return true;
+  }
+  else
+    fail("nullmailer-queue crashed or was killed.");
 }
 
 bool send_message()
 {
-  return show_message ? send_message_stdout() : send_message_nqueue();
+  if(show_message) {
+    nqpipe = &fout;
+    if(show_envelope)
+      send_env();
+    send_header();
+    send_body();
+    return true;
+  }
+  else
+    return start_queue() &&
+      send_env() && send_header() && send_body() &&
+      wait_queue();
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -489,6 +589,23 @@ bool send_message()
 ///////////////////////////////////////////////////////////////////////////////
 bool parse_flags()
 {
+  CINIFile inifile;
+  BOOL bValue;
+
+  inifile.SetINIFilename(config_file);
+  if(inifile.GetBoolValue(bValue,"USE_NAME_ADDRESS_STYLE"))
+  	use_name_address_style=bValue;
+  if(inifile.GetBoolValue(bValue,"IGNORE_HEADER_FIELD_FROM"))
+  	 header_field_from.ignore=bValue;
+  if(inifile.GetBoolValue(bValue,"IGNORE_HEADER_FIELD_MID"))
+  	 header_field_mid.ignore=bValue;
+  if(inifile.GetBoolValue(bValue,"IGNORE_HEADER_FIELD_RPATH"))
+  	 header_field_rpath.ignore=bValue;
+  if(inifile.GetBoolValue(bValue,"HEADER_ADD_TO"))
+  	 header_add_to=bValue;
+  if(inifile.GetBoolValue(bValue,"MAIL_HEADER_REMOVE_FROM"))
+  	 header_remove_from=bValue;
+  
   for(const char* flagstr = getenv("NULLMAILER_FLAGS");
       flagstr && *flagstr; flagstr++) {
     switch(*flagstr) {
@@ -497,6 +614,7 @@ bool parse_flags()
     case 'i': header_field_mid.ignore=header_field_mid.remove=true; break;
     case 's': header_field_rpath.ignore=header_field_rpath.remove=true; break;
     case 't': header_add_to = true; break;
+    case 'x': header_remove_from = true; break;
     default:
       // Just ignore any flags we can't handle
       break;
@@ -512,14 +630,11 @@ bool parse_args(int argc, char* argv[])
   if(o_from) {
     mystring list;
     mystring tmp(o_from);
-    if(tmp == "" || tmp == "<>")
-      sender = "";
-    else if(!parse_addresses(tmp, list) ||
-            !parse_sender(list)) {
-      ferr << "nullmailer-inject: Invalid sender address: " << o_from << endl;
+    if(!parse_addresses(tmp, list) ||
+       !parse_sender(list)) {
+      fout << "nullmailer-inject: Invalid sender address: " << o_from << endl;
       return false;
     }
-    use_header_sender = false;
   }
   use_header_recips = (use_recips != use_args);
   if(use_recips == use_header)
@@ -529,7 +644,7 @@ bool parse_args(int argc, char* argv[])
   bool result = true;
   for(int i = 0; i < argc; i++) {
     if(!parse_recip_arg(argv[i])) {
-      ferr << "Invalid recipient: " << argv[i] << endl;
+      fout << "Invalid recipient: " << argv[i] << endl;
       result = false;
     }
   }
@@ -544,7 +659,7 @@ int cli_main(int argc, char* argv[])
      !fix_header())
     return 1;
   if(recipients.count() == 0) {
-    ferr << "No recipients were listed." << endl;
+    fout << "No recipients were listed." << endl;
     return 1;
   }
   if(!send_message())

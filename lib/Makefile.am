@@ -18,6 +18,7 @@ libmisc_a_SOURCES = \
 	errcodes.h errcodes.cc \
 	hostname.h hostname.cc \
 	itoa.h itoa.cc \
+	inifile.h inifile.cc \
 	makefield.cc makefield.h \
 	netstring.h netstring.cc \
 	forkexec.cc forkexec.h \
